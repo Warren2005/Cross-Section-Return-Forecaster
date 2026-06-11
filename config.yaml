@@ -1,0 +1,63 @@
+# CSRF Pipeline — Default Hyperparameters
+# Edit this file to override any setting without touching source code.
+# All values here correspond to fields in src/utils/config.py.
+
+# Set to true to run a tiny subsample (200 stocks × 24 months) through
+# the full pipeline in minutes. Use for debugging, not for real results.
+fast_dev: false
+
+results_dir: "results"
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  splits_dir: "data/splits"
+
+  # Period boundaries (YYYY-MM strings)
+  train_start: "1957-01"
+  train_end:   "1999-12"
+  cal_start:   "2000-01"
+  cal_end:     "2007-12"
+  test_start:  "2008-01"
+  test_end:    "2021-12"
+  val_start:   "1992-01"   # validation set starts here (last ~20% of training)
+
+  # fast_dev subsample sizes
+  fast_dev_n_stocks: 200
+  fast_dev_n_months: 24
+
+model:
+  n_chars: 168              # 94 characteristics + 74 industry dummies
+  hidden_dims: [32, 16, 8, 4]
+  dropout: 0.10
+
+  lr: 0.001
+  weight_decay: 0.00001
+  huber_delta: 0.5          # Huber loss threshold (return units, ~0.5%/month)
+  batch_size: 2048
+  max_epochs: 200
+  early_stopping_patience: 20
+  lr_scheduler_patience: 10
+  lr_scheduler_factor: 0.5
+  lr_min: 0.00001
+
+  num_workers: 0            # Windows CPU: always 0
+  pin_memory: false
+  checkpoint_every_n_epochs: 5
+  checkpoint_dir: "data/splits"
+  seed: 42
+
+spci:
+  alpha: 0.10               # 90% prediction intervals
+  L: 24                     # months of lagged residuals as features
+  min_history: 12           # min months before using SPCI (else fallback)
+  n_estimators: 200
+  max_depth: 4
+  learning_rate: 0.05
+  subsample: 0.8
+
+portfolio:
+  n_deciles: 10
+  lambda_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  half_spread_bps: 20.0
+  fm_bandwidth: 6
