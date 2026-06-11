@@ -490,23 +490,96 @@ The script generates three prediction files, each with columns `[permno, date, y
 
 ## 5. Conformal Layer
 
-*This section will be filled in during Phase 3 implementation.*
-
 ### 5.1 Why SPCI over Standard Split Conformal
 
-*[To be written]*
+**What standard split conformal gives you:** A single global quantile `q̂` computed from all calibration residuals. Every stock in every test month gets the same interval width: `[ŷ - q̂, ŷ + q̂]`. This guarantees ≥ 90% coverage marginally across all test observations. The guarantee is mathematically exact.
+
+**Why that's not enough for this project:** If every stock gets the same interval width, the interval width carries no information — it is constant. Our entire research hypothesis (Section 2.4) depends on width varying across stocks. A stock with a chaotic recent residual history should get a wider interval than a stock that the model has been predicting accurately for two years. Standard conformal cannot produce this variation.
+
+**What SPCI adds:** SPCI (Xu & Xie, ICML 2023) fits a quantile regression model to predict the CONDITIONAL quantile of the next residual, conditioning on the stock's recent residual history. This means:
+- Stocks with large, volatile recent residuals → wide interval
+- Stocks with small, stable recent residuals → narrow interval
+- The quantile model is fixed (fit on calibration data) — it is a learned mapping from "residual pattern" to "expected next residual magnitude"
+
+**Why standard conformal's exchangeability assumption fails:** Standard conformal requires the calibration and test points to be *exchangeable* — roughly, interchangeable. In our panel, this is violated because:
+1. Returns in month t are correlated with returns in month t-1 (time-series autocorrelation)
+2. In any given month, all stock returns are correlated through market factors
+
+SPCI is designed explicitly for this non-exchangeable time-series setting. Its coverage guarantee degrades gracefully rather than catastrophically during stress regimes.
+
+**Asymmetric vs. symmetric intervals:** The spec describes symmetric intervals; we implement asymmetric ones (two separate quantile models: one for the α/2 lower tail and one for the 1-α/2 upper tail of the signed residual). Asymmetric intervals are more general: they correctly capture the skewness of the residual distribution (negative during market crashes, positive during rallies). The interval is:
+```
+lower = ŷ + q̂_{α/2}    (q̂_{α/2} is negative, from the lower quantile model)
+upper = ŷ + q̂_{1-α/2}  (q̂_{1-α/2} is positive, from the upper quantile model)
+width = q̂_{1-α/2} - q̂_{α/2}
+```
+
+**Implementation:** `src/conformal/spci.py:CrossSectionalSPCI`
 
 ### 5.2 Feature Design for the Quantile Model
 
-*[To be written]*
+The quantile GBM maps a stock's recent residual pattern to a predicted residual magnitude. The features for stock i at time t are:
+
+| Feature group | Columns | Purpose |
+|--------------|---------|---------|
+| Lagged absolute residuals | `f_abs_1` … `f_abs_L` | Captures recent prediction error magnitudes (volatility clustering) |
+| Lagged residual signs | `f_sign_1` … `f_sign_L` | Captures directional bias (consistent underestimation or overestimation) |
+| Rolling 12-month std of `|ε|` | `f_rolling_std` | Medium-term volatility regime for the stock |
+| Rolling 12-month mean of `|ε|` | `f_rolling_mae` | Baseline prediction accuracy for the stock |
+
+Total: 2L + 2 = 50 features for L=24.
+
+**Why absolute residuals as features?** Volatility clustering is the dominant feature of financial residuals: if `|ε_{t-1}|` was large, `|ε_t|` is likely large. This is captured by the absolute lag features.
+
+**Why signs as features?** A stock that the model consistently overestimates (negative signs) may be in a regime where the model's return prediction is systematically biased — a wider asymmetric interval is warranted.
+
+**Why the rolling stats?** The L lagged features capture short-term dynamics. The rolling stats capture the medium-term baseline: a stock that has been consistently hard to predict (high MAE over 12 months) warrants wider intervals than a stock with occasional spikes in an otherwise predictable history.
+
+**History source:** Features are computed from the *combined* history: training + calibration + test residuals. The model is fit only on calibration rows, but the features for test-month predictions include any test-period residuals accumulated before that month. This is valid because the quantile model is a fixed function (learned from calibration) applied to current inputs — analogous to using a VIX-based rule whose rule was calibrated historically but whose inputs (current VIX) come from the current period.
+
+**Implementation:** `src/conformal/spci.py:build_feature_panel()`, `feature_columns()`
 
 ### 5.3 Fallback for Short-History Stocks
 
-*[To be written]*
+Stocks with fewer than `min_history` (default: 12) months of residual history cannot have their lag features computed. This includes:
+- IPOs and new listings (few months of data)
+- Stocks that were in the dataset but had data gaps
+
+For these stocks, we fall back to **standard split conformal**: a symmetric interval using the global empirical quantile of absolute calibration residuals, with the finite-sample correction:
+
+```
+q̂_fallback = quantile(|ε_cal|, ⌈(n+1)(1-α)⌉/n)
+Interval = [ŷ - q̂_fallback, ŷ + q̂_fallback]
+```
+
+The `(n+1)/n` correction ensures that coverage is ≥ (1-α) even for small calibration sets. With ~300k calibration residuals, the correction is negligible but is included for theoretical correctness.
+
+The fallback produces constant-width intervals for all affected stocks. Because most established stocks have long histories, the fallback is used for a small fraction of test observations (typically 5–15%, concentrated in the first few test years).
+
+**Implementation:** `src/conformal/fallback.py:calibration_quantile()`
 
 ### 5.4 Interpreting the Coverage Table
 
-*[To be written]*
+**What the coverage table shows:** For each time period and stock characteristic group, the fraction of realized returns falling inside the predicted interval. For a 90% interval (α=0.10), we want this fraction to be ≥ 90% everywhere.
+
+**Expected results (from the spec's illustrative table):**
+
+| Period | Expected coverage | Why |
+|--------|------------------|-----|
+| Full test (2008–2021) | 91–92% | Overall guarantee holds |
+| 2008–09 crisis | 88–90% | Severe distribution shift; SPCI degrades gracefully |
+| 2020 COVID | 88–90% | Extreme tail event; same |
+| 2022 rate shock | 90–91% | Modest distribution shift |
+| Low-volatility stocks | 92–93% | Easy to predict; intervals slightly conservative |
+| High-volatility stocks | 88–90% | Hardest to cover; near the guarantee boundary |
+
+**Why coverage dips below 90% during crises:** SPCI's coverage guarantee is asymptotic and assumes the conditional quantile model is well-specified. During a market crash, the residual distribution shifts dramatically (tail events that the calibration period never saw). The guarantee is that *on average* coverage ≥ 90%; individual extreme months may fall below. This is unavoidable with any finite-sample method — including bootstrap and Bayesian intervals, which typically perform *worse* during crises because their model assumptions are more severely violated.
+
+**Gate check:** The pipeline enforces coverage ≥ 90% on the full test set before allowing Phase 4 to proceed. If coverage falls short:
+1. Check that the calibration period (not the training period) was used to fit the SPCI model
+2. Check that `source_filter='cal'` was passed to `spci.fit()`
+3. Check that the fallback quantile was computed correctly (it should be the 90th percentile of `|ε_cal|`, not the raw residuals)
+4. Increase `n_estimators` in the GBM if the quantile model is underfitting
 
 ---
 
