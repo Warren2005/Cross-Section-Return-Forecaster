@@ -391,19 +391,100 @@ It is never used to train the NN and never used to report final results. Violati
 
 ## 4. Base Model
 
-*This section will be filled in during Phase 2 implementation.*
-
 ### 4.1 Architecture Choices
 
-*[To be written: why skip connections, why BatchNorm, why Huber loss, how this departs from Gu et al.]*
+The network is a 5-layer feed-forward network matching the Gu et al. (2020) NN5 specification: Input → 32 → 16 → 8 → 4 → 1. We add three modifications; each is justified below.
+
+**BatchNorm1d before each activation**
+
+Cross-sectional features have very different scales even after rank normalisation — a stock's characteristics vary across industries, size groups, and time periods in ways that aren't fully removed by the per-column normalisation. BatchNorm rescales each hidden layer's activations to zero mean and unit variance before the ReLU, which prevents the gradient from vanishing in deeper layers and speeds up convergence substantially. Without BatchNorm, training on the full GKX panel with 168 features typically diverges or converges very slowly on CPU. Gu et al. do not use BatchNorm (they use a simpler architecture and likely had GPU resources), but it is standard practice in modern MLPs for tabular data.
+
+**Skip connection from layer 1 to layer 3**
+
+```
+h3 = layer3(layer2(h1)) + skip_proj(h1)
+```
+
+The skip connection allows layer 4 and the output layer to receive a direct gradient signal from layer 1, bypassing the two intermediate transformations. Without it, the gradient signal from the output (which is a very noisy single-month return) must pass through four non-linear layers before reaching the first layer's weights — causing slow learning of the early feature representations. The skip projection (`Linear(32, 8)`) is a learned linear map, not a residual identity, because the dimensions differ.
+
+**Huber loss (δ = 0.5) instead of MSE**
+
+Monthly stock returns have heavy tails: kurtosis is typically 10–20× that of a normal distribution. Crisis months (October 2008, March 2020) produce returns of -30% or worse for some stocks. Under MSE loss, these extreme observations dominate the gradient — a single month can move the parameters more than dozens of normal months. Huber loss is quadratic (like MSE) for errors smaller than δ and linear (like MAE) for errors larger than δ. With δ = 0.5 (in return units, so 0.5% monthly), the loss limits the influence of outliers beyond ±0.5% returns while still producing unbiased gradients for the typical range of returns.
+
+**Kaiming initialisation**
+
+All Linear layers use Kaiming uniform initialisation (He et al. 2015), which is designed for ReLU activations and ensures the variance of activations is preserved at initialisation. Random initialisation with standard normal would cause gradients to vanish immediately for a network this deep.
+
+**Implementation:** `src/models/network.py:ReturnPredictor`
 
 ### 4.2 Training Protocol
 
-*[To be written: why no temporal shuffling, the ChronologicalBatchSampler, why we validate on the last 20% of training by time]*
+**Why chronological batching is mandatory**
+
+Standard PyTorch DataLoader shuffles the entire dataset randomly before each epoch. In our setting, this would allow the model to see stock A's return in month t+1 before it processes stock A's characteristics in month t — information leakage. More subtly, random shuffling means the model can observe the *distribution* of future returns during training, which inflates out-of-sample performance.
+
+`ChronologicalBatchSampler` enforces two constraints:
+1. All observations in a batch belong to the same calendar month.
+2. Months are emitted in ascending chronological order.
+
+Within each month, stocks are shuffled randomly (controlled by seed + epoch for reproducibility). This within-month shuffle is safe because all stocks in a given month share the same calendar date — there is no temporal ordering to violate.
+
+**Train / validation split within training**
+
+The 1957–1999 training period is divided at `val_start = 1992-01`:
+- **Pure training (1957–1991, ~35 years):** gradient updates
+- **Validation (1992–1999, ~8 years):** early stopping only — no gradients
+
+This split gives the validation set a different market regime from the pure training set (1990s bull market vs. the mixed 1957–1991 period), which makes early stopping more informative. The validation loss is computed on a forward-pass with `torch.no_grad()` — the model never fits to validation data.
+
+**Early stopping:** If validation loss does not improve for 20 consecutive epochs, training stops and the best weights are restored. This prevents overfitting on the noisy return signal without requiring a fixed epoch count.
+
+**Checkpointing (critical for CPU)**
+
+The script saves the best model to `data/splits/best_model.pt` whenever validation loss improves, and saves a periodic snapshot every 5 epochs to `data/splits/checkpoint_epoch_NNN.pt`. If training is interrupted (power outage, closed terminal), re-running `02_train_model.py` automatically resumes from `best_model.pt`. This is essential given that a full CPU training run can take 6–15 hours.
+
+**CPU-specific settings**
+
+- `num_workers=0`: PyTorch's multiprocess data loading is unreliable on Windows. Using the main process avoids deadlocks.
+- `pin_memory=False`: `pin_memory` accelerates GPU transfers; on CPU it wastes time.
+- `batch_size=2048`: large enough that each month (~3,000 stocks) fits in 1–2 batches, small enough to keep per-batch gradient updates meaningful.
+
+**Implementation:** `src/models/train.py:ChronologicalBatchSampler`, `train()`
 
 ### 4.3 Validating Against Gu et al.
 
-*[To be written: the R² target, how to interpret deviations, common bugs that cause low R²]*
+**The target**
+
+Gu et al. (2020) report OOS R² ≈ 0.40% for NN5 in their Table 4. Our implementation should land in [0.20%, 0.65%]:
+- Below 0.20%: likely a preprocessing bug (look-ahead bias not properly prevented, or rank normalisation applied in the wrong order)
+- Above 0.65%: almost certainly data leakage — future information contaminating training
+
+We evaluate R² on the *calibration set* (2000–2007), not the test set, to preserve test-set integrity during development.
+
+**OOS R² formula**
+
+```
+R² = 1 - Σ(y - ŷ)² / Σ(y - ȳ_train)²
+```
+
+The denominator uses `ȳ_train` — the mean return from the training set — not the mean from the calibration or test set. This is Gu et al.'s exact formula. It is more conservative than using the in-sample mean because the historical mean changes over time.
+
+**Common failure modes**
+
+| Symptom | Most likely cause |
+|---------|------------------|
+| R² < 0 (worse than mean forecast) | Lag enforcement not applied; features contain future data |
+| R² ≈ 0 (tiny positive) | Characteristics overfit to training period; try smaller model |
+| R² > 1% | Data leakage — test data is contaminating the training set |
+| L-S Sharpe < 0.5 | Batch sampler bug (shuffling across months); check `ChronologicalBatchSampler` |
+| Training loss diverges | BatchNorm or learning rate issue; try lr=1e-4 |
+
+**Inference outputs**
+
+The script generates three prediction files, each with columns `[permno, date, y_true, y_pred, residual]`:
+- `train_predictions.parquet` — needed by Phase 3 to build SPCI residual histories
+- `cal_predictions.parquet` — used for SPCI fitting and λ tuning
+- `test_predictions.parquet` — all final evaluation in Phase 4 and 5
 
 ---
 
