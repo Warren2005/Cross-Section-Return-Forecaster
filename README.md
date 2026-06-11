@@ -5,10 +5,19 @@ A research pipeline that applies conformal prediction to ML-based stock return f
 ## Quick Start
 
 ```bash
+# Create and activate the virtual environment (do this once)
+python -m venv .venv
+
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+# macOS / Linux
+source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-Run the full pipeline phase by phase:
+Run the full pipeline phase by phase (venv must be active):
 
 ```bash
 python scripts/01_build_data.py        # Phase 1: preprocess GKX data

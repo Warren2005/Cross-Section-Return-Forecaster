@@ -300,23 +300,92 @@ Positive IC means the signal is directionally correct more often than not. Month
 
 ## 3. Data
 
-*This section will be filled in during Phase 1 implementation.*
-
 ### 3.1 The GKX Dataset
 
-*[To be written: dataset structure, download location, column naming conventions, coverage statistics]*
+**Download:** https://dachxiu.chicagobooth.edu/#rp (free, no login required). The file is a zip containing a SAS `.sas7bdat` file or CSV. Place it in `data/raw/`; the loader auto-detects the format.
+
+**Structure:** ~30,000 US stocks, monthly observations from 1957-01 to 2021-12. Each row is a (permno, month) pair with:
+- `permno` — CRSP permanent stock identifier (integer, stable across corporate events)
+- `date` — encoded as YYYYMM integer in the raw file; parsed to `pd.Period('M')` by the loader
+- `ret` — monthly excess return (already net of the risk-free rate)
+- 94 firm-level characteristics (accounting ratios, price-based signals, etc.)
+- 74 industry dummy columns (binary 0/1, based on 2-digit SIC codes)
+
+**Missing values:** Characteristics are frequently missing for small or newly-listed firms. Roughly 10–30% of characteristic-stock-month cells are NaN in the raw data. Rank normalization preserves these NaNs (using `na_option='keep'`). The neural network imputes NaN to 0 in its DataLoader, which equals the cross-sectional median after normalization to [-1, 1].
+
+**Column detection:** `loader.py` detects industry dummy columns by SIC prefix naming (`sic10`, `sic12`, etc.) or falls back to identifying binary {0,1} columns. Characteristics are everything that is neither an identifier nor a dummy. Column metadata is saved to `data/splits/column_meta.json` by `01_build_data.py` for use by all downstream scripts.
+
+**Why parquet for storage?** The GKX panel with all columns is ~2 GB as CSV. Parquet compresses this to ~200 MB, preserves dtypes (critical for `pd.Period` date columns), and supports column-subset loading — loading only the feature columns without reading `ret` avoids unnecessary RAM use during model training.
 
 ### 3.2 Rank Normalization
 
-*[To be written: why rank normalization instead of winsorization or z-scoring, the [-1,1] mapping, what happens to outliers]*
+**What it does:** Within each month, for each characteristic, rank all stocks (average rank for ties) and map the ranks to `[-1, 1]` using:
+
+```
+normalized = 2 × (rank - 1) / (n_valid - 1) - 1
+```
+
+where `n_valid` is the number of non-missing values in that month. A stock at the cross-sectional median gets 0; the lowest-ranked stock gets -1; the highest-ranked gets +1.
+
+**Why rank normalization instead of winsorization or z-scoring?**
+
+Three reasons:
+
+1. **Outlier robustness without arbitrary thresholds.** Winsorizing (capping at e.g. the 1st/99th percentile) requires choosing thresholds; the choice materially affects results and different papers use different levels. Z-scoring doesn't remove outliers at all — a stock with book-to-market of 100× the median remains 100× after z-scoring. Rank normalization maps every stock to [-1, 1] regardless of the magnitude of its raw value.
+
+2. **Temporal comparability.** Raw characteristic values drift over time (e.g., average P/E ratios are higher in 2020 than 1960). After rank normalization, the cross-sectional distribution is always uniform on [-1, 1] in every month, making the feature space stationary over the 65-year sample.
+
+3. **Preserves ordinal information.** We care about relative ordering (is stock A richer than stock B on this metric?) not absolute levels. Rank normalization is a monotone transformation — it preserves ordering exactly.
+
+**Industry dummies:** The 74 binary industry indicators are also rank-normalized. For a binary column, this separates the in-industry stocks (which receive a value near +1) from out-of-industry stocks (near -1), with the exact values depending on the proportion of stocks in that industry that month. This is consistent with Gu et al. and allows the NN to learn industry-adjusted signals uniformly.
+
+**Implementation:** `preprocess.py:rank_normalize()`. Applied date-by-date with a tqdm progress bar (the full panel takes several minutes on CPU).
 
 ### 3.3 Lag Enforcement and Look-Ahead Bias
 
-*[To be written: the lag rules table, what look-ahead bias means and how it contaminates results, specific filing delay assumptions]*
+**What look-ahead bias means:** If we use a characteristic at its current value (e.g., the book-to-market ratio as of the balance sheet date) to predict the stock's return in the same month, we are using information that was not publicly available at the time of trading. This artificially inflates predictive performance and makes the strategy impossible to implement live.
+
+**The specific problem in financial data:** Accounting data is not published instantaneously. A firm's annual earnings for fiscal year ending December 31 are typically filed with the SEC 60–90 days later (March/April). If we use December 31 accounting data to form a January portfolio, we are using data that didn't exist yet in January.
+
+**Our lag rules** (following Gu et al. 2020 exactly):
+
+| Characteristic frequency | Filing delay | Lag applied |
+|--------------------------|-------------|-------------|
+| Monthly (price, volume)  | 1 month     | 1-month row shift per stock |
+| Quarterly (earnings)     | 4 months    | 4-month row shift per stock |
+| Annual (balance sheet)   | 6 months    | 6-month row shift per stock |
+
+**Implementation detail:** Lags are applied as row shifts within each stock's time series (`groupby('permno').shift(N)`). This is valid when each stock appears at most once per month, which holds for the GKX panel. The shift introduces NaN values for the first N months of each stock's history — these are handled by the NaN-preserving rank normalization and the NN's zero imputation.
+
+**Order matters:** Lags are applied BEFORE rank normalization. If we normalized first, then lagged, we would be rank-normalizing the unlagged raw values and then discarding them — we would lose the cross-sectional ordering information that normalization preserves.
+
+**Characteristic classification:** The 94 characteristics are assigned to frequency categories using the lists in `src/utils/config.py` (`MONTHLY_CHARS`, `QUARTERLY_CHARS`). Anything not in either list is treated as annual (6-month lag) — this is conservative, erring on the side of longer delays when unsure.
 
 ### 3.4 Train / Calibration / Test Split
 
-*[To be written: why 1999/2000/2008 cutpoints, how many stock-months in each set, what the calibration set is used for]*
+**The three sets:**
+
+| Set | Dates | Months | Purpose |
+|-----|-------|--------|---------|
+| Train | 1957-01 to 1999-12 | 504 | NN weight learning |
+| Calibration | 2000-01 to 2007-12 | 96 | SPCI quantile model; λ tuning |
+| Test | 2008-01 to 2021-12 | 168 | All evaluation |
+
+**Why 1999/2000 as the train/cal boundary?**
+
+The calibration set needs to be large enough to estimate stable conformal quantiles. With ~3,000 stocks per month over 96 months, the calibration set contains approximately 288,000 stock-month residuals — more than enough for the SPCI quantile model. Starting calibration in 2000 also gives the NN 43 years of training data (1957–1999), which is the same range used by Gu et al. for their main results.
+
+**Why 2008 as the cal/test boundary?**
+
+2008 is where the interesting evaluation happens. The test set contains three major market stress regimes: the 2008–2009 financial crisis, the 2020 COVID shock, and the 2022 interest rate shock. These are the hardest cases for any prediction model and the most important cases for testing the conformal coverage guarantee. Starting the test set in 2008 maximises the stress-test content of the evaluation period.
+
+**The calibration set quarantine rule:** The calibration set is used for exactly two things:
+1. Computing the SPCI residual quantile model (Phase 3)
+2. Tuning the portfolio weight λ (Phase 5)
+
+It is never used to train the NN and never used to report final results. Violating this rule — e.g., by looking at test-set results and then adjusting parameters — would constitute data snooping and invalidate the research findings.
+
+**Validation:** `splits.py:_validate_splits()` asserts that no date appears in more than one split before returning. This is a hard guard against date-boundary bugs.
 
 ---
 
