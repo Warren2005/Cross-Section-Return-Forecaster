@@ -173,17 +173,17 @@ def print_metrics(
           f"t={ls['ls_tstat']:.2f}, n={ls['n_months']}mo)")
     print(f"  Mean IC:         {ic['mean_ic']:.4f}  "
           f"(IR={ic['ir']:.2f})")
-    print(f"\n  Decile mean returns (D1=short → D{n_deciles}=long):")
+    print(f"\n  Decile mean returns (D1=short -> D{n_deciles}=long):")
     for i, r in enumerate(ls["decile_mean_returns"]):
-        bar = "█" * int(abs(r * 1000))
+        bar = "#" * int(abs(r * 1000))
         sign = "+" if r >= 0 else "-"
         print(f"    D{i+1:2d}: {sign}{abs(r)*100:.3f}%  {bar}")
     print(f"{'='*55}")
 
     # Gu et al. benchmark check
     if r2 < 0.002:
-        print(f"  ⚠  OOS R² ({r2*100:.4f}%) is below 0.20% — check preprocessing.")
+        print(f"  [!]  OOS R2 ({r2*100:.4f}%) is below 0.20% -- check preprocessing.")
     elif r2 > 0.0065:
-        print(f"  ⚠  OOS R² ({r2*100:.4f}%) is above 0.65% — may indicate data leakage.")
+        print(f"  [!]  OOS R2 ({r2*100:.4f}%) is above 0.65% -- may indicate data leakage.")
     else:
-        print(f"  ✓  OOS R² in expected range [0.20%, 0.65%] — implementation looks correct.")
+        print(f"  [OK]  OOS R2 in expected range [0.20%, 0.65%] -- implementation looks correct.")

@@ -585,19 +585,76 @@ The fallback produces constant-width intervals for all affected stocks. Because 
 
 ## 6. Width Signal
 
-*This section will be filled in during Phase 4 implementation.*
-
 ### 6.1 Fama-MacBeth Regression Setup
 
-*[To be written]*
+**Why Fama-MacBeth?**
+
+A simple correlation between width and return is confounded by time effects: in high-volatility months, both width and return variation are large simultaneously. Fama-MacBeth removes this by running a separate cross-sectional regression *within each month* and then averaging the monthly coefficients. The result is a time-series average of monthly cross-sectional slopes — this is the standard method for testing whether a characteristic predicts returns in the cross-section.
+
+**The regression:**
+
+```
+ret_{i,t+1} = a_t + b_t·ŷ_{i,t} + c_t·width_pct_{i,t} + d_t·me_{i,t}
+            + e_t·bm_{i,t} + f_t·mom12m_{i,t} + g_t·mom1m_{i,t} + ε_{i,t+1}
+```
+
+Each variable is at time t; the dependent variable is the return in the NEXT month t+1. We include `ŷ_{i,t}` (the point estimate) to ensure the width coefficient is capturing information *orthogonal* to the NN's prediction. If the coefficient on width is negative even after controlling for the point estimate, the uncertainty itself predicts returns.
+
+**Forward vs. same-period returns:**
+
+We use forward returns (t+1) rather than same-period returns (t) for two reasons:
+1. **Practical relevance:** In live trading, you form your portfolio at the end of month t using information available at t, then observe returns in month t+1. This matches the operational setup.
+2. **Theory:** If uncertainty is persistent (a stock that's hard to predict this month is likely hard to predict next month too), then month t's width contains predictive information for month t+1's return.
+
+**Controls used and why rank-normalised proxies are acceptable:**
+
+The standard Fama-MacBeth controls require market cap (for log-size) and book equity (for B/M). Both are available in the GKX panel as characteristics, but after rank normalisation to [-1, 1]. Using rank-normalised proxies instead of raw log values is acceptable for Fama-MacBeth because:
+1. The rank is a monotone transformation of the original, so the cross-sectional ordering (which determines the regression coefficient) is preserved.
+2. Cross-sectional regressions are identified by relative ordering, not absolute levels.
+3. The t-statistics on the controls will differ in scale but not in sign or significance.
+
+When CRSP data is available, replace `me` and `bm` with their log-transformed CRSP values for direct comparison with published papers.
+
+**Width normalisation:** Width is converted to its cross-sectional percentile rank within each month (`width_pct` ∈ [0, 1]) before entering the regression. This makes the coefficient stable across months with different average widths (e.g., crisis vs. normal months).
+
+**Standard errors:** Newey-West kernel standard errors with bandwidth=6 (6 monthly lags). This accounts for autocorrelation in the monthly cross-sectional coefficients, which is a known feature of Fama-MacBeth regressions.
+
+**Implementation:** `src/analysis/width_signal.py:fama_macbeth()`
 
 ### 6.2 Double-Sort Interpretation
 
-*[To be written]*
+The double sort answers a specific question: **does model confidence (narrow width) improve the quality of the point-estimate signal?**
+
+**Setup:** Each month, sort stocks into 3 equal groups by interval width (terciles). Within each tercile, sort stocks into 10 deciles by predicted return (`y_pred`). Compute the long-short portfolio (top PE decile minus bottom PE decile) within each width tercile.
+
+**Expected result:**
+- T1 (narrowest width): highest L-S Sharpe — the NN's point estimate is most reliable here; sorting on it works well
+- T2 (medium width): intermediate L-S Sharpe
+- T3 (widest width): lowest L-S Sharpe — the NN is uncertain; its point estimate is noise-contaminated and sorting on it works poorly
+
+**What this means for portfolio construction:** If T1 has significantly higher Sharpe than T3, it means you should weight the point estimate more heavily for confident stocks and less for uncertain ones — exactly the logic behind the uncertainty-conditioned score in Phase 5.
+
+**Connection to H2 from the spec:** This is testing H2 (Width × direction interaction). A significant drop in PE-sort Sharpe from T1 to T3 confirms that model uncertainty degrades the signal quality asymmetrically — and that conditioning on width improves portfolio construction.
+
+**Implementation:** `src/analysis/width_signal.py:double_sort()`
 
 ### 6.3 FF5 Alpha and What It Proves
 
-*[To be written]*
+**Why alpha is the gold standard:**
+
+A long-short portfolio that earns a positive return might just be earning compensation for bearing known risk factors (market risk, size risk, value risk, profitability, investment). The Fama-French 5-factor model (MKT, SMB, HML, RMW, CMA) is the standard risk model for equity strategies. Running a time-series regression of the portfolio's monthly returns on these five factors produces an **alpha** — the return left unexplained by all five risk factors.
+
+A positive alpha with t-stat > 2.0 means: the width signal earns returns that *cannot* be explained by compensation for known systematic risks. This is the strongest possible evidence that the signal contains genuinely new information.
+
+**The width L-S portfolio's expected factor exposures:**
+
+- **SMB (small minus big):** Narrow-width stocks tend to be large caps (well-covered, easy to predict). Wide-width stocks tend to be small caps (illiquid, hard to predict). So the width L-S (long narrow, short wide) will have a NEGATIVE SMB loading — it is implicitly short small caps. This means some of the raw L-S return is just compensation for avoiding small-cap risk.
+- **RMW (robust minus weak profitability):** Uncertain stocks often have weaker profitability — the model struggles to predict them partly because their fundamentals are unstable. Expect a positive RMW loading.
+- After stripping out these systematic exposures, any remaining alpha represents the information in width *beyond* what is already captured by size and profitability factors.
+
+**The computation (Phase 5):** Run OLS of the monthly L-S portfolio return on [MKT, SMB, HML, RMW, CMA, constant] using Ken French's factor data. Report the constant (alpha) and its t-statistic. The FF5 alpha computation happens in Phase 5 alongside portfolio construction.
+
+**Implementation:** `src/analysis/portfolio.py:compute_ff5_alpha()` (Phase 5)
 
 ---
 

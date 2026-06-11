@@ -86,7 +86,7 @@ def coverage_by_period(
             "Coverage":      f"{sub['covered'].mean()*100:.1f}%",
             "Width (bps)":   f"{sub['width_bps'].mean():.0f}",
             "Mean |resid|":  f"{sub['abs_resid'].mean()*10_000:.0f} bps",
-            "Pass (≥target)": "✓" if sub["covered"].mean() >= target_coverage else "✗",
+            "Pass (>=target)": "Y" if sub["covered"].mean() >= target_coverage else "N",
         }
 
     # Full test set
@@ -161,7 +161,7 @@ def coverage_by_volatility_decile(
             "Vol decile":    f"D{d+1} ({'low' if d==0 else 'high' if d==n_deciles-1 else ''})",
             "Coverage":      f"{sub['covered'].mean()*100:.1f}%",
             "Width (bps)":   f"{sub['width_bps'].mean():.0f}",
-            "Pass":          "✓" if sub["covered"].mean() >= target else "✗",
+            "Pass":          "Y" if sub["covered"].mean() >= target else "N",
         })
     return pd.DataFrame(rows)
 
@@ -210,7 +210,7 @@ def coverage_by_size_decile(
             "Size decile":  f"D{d+1} ({'micro' if d==0 else 'mega' if d==n_deciles-1 else ''})",
             "Coverage":     f"{sub['covered'].mean()*100:.1f}%",
             "Width (bps)":  f"{sub['width_bps'].mean():.0f}",
-            "Pass":         "✓" if sub["covered"].mean() >= target else "✗",
+            "Pass":         "Y" if sub["covered"].mean() >= target else "N",
         })
     return pd.DataFrame(rows)
 
@@ -228,12 +228,12 @@ def print_coverage_report(
     target = (1.0 - alpha) * 100
 
     print(f"\n{'='*65}")
-    print(f"  COVERAGE VALIDATION  (target: ≥ {target:.0f}%,  α={alpha})")
+    print(f"  COVERAGE VALIDATION  (target: >= {target:.0f}%,  alpha={alpha})")
     print(f"{'='*65}")
 
     # Overall
     overall = empirical_coverage(interval_df)
-    status  = "✓ PASS" if overall >= 1.0 - alpha else "✗ FAIL"
+    status  = "[PASS]" if overall >= 1.0 - alpha else "[FAIL]"
     print(f"\n  Overall coverage: {overall*100:.2f}%  {status}")
 
     spci_pct = interval_df["used_spci"].mean() * 100 if "used_spci" in interval_df else float("nan")
@@ -262,7 +262,7 @@ def print_coverage_report(
 
     # Gate check
     if overall < 1.0 - alpha:
-        print(f"  ⚠  GATE FAILED: overall coverage {overall*100:.2f}% < {target:.0f}%")
-        print(f"     Do not proceed to Phase 4 — debug SPCI fitting.")
+        print(f"  [!]  GATE FAILED: overall coverage {overall*100:.2f}% < {target:.0f}%")
+        print(f"     Do not proceed to Phase 4 -- debug SPCI fitting.")
     else:
-        print(f"  ✓  Gate passed: proceed to Phase 4.")
+        print(f"  [OK]  Gate passed: proceed to Phase 4.")
