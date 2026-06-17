@@ -185,6 +185,20 @@ def main() -> None:
     save_parquet(test_intervals, splits_dir / "test_intervals.parquet")
     print(f"  Saved: test_intervals.parquet")
 
+    # Also compute cal-set intervals for Phase 5 lambda tuning.
+    # The SPCI model was fitted on cal data, so this is in-sample for the cal
+    # period — which is acceptable for lambda selection (we never claim conformal
+    # coverage guarantees for the cal set; see LEARNING.md §7.1).
+    print("  Computing cal-set intervals for lambda tuning...")
+    cal_pred_df = cal_preds[["permno", "date", "y_pred", "y_true"]].copy()
+    cal_intervals = spci.predict_intervals(
+        pred_df             = cal_pred_df,
+        feature_panel       = feature_panel,
+        fallback_half_width = fallback_q,
+    )
+    save_parquet(cal_intervals, splits_dir / "cal_intervals.parquet")
+    print(f"  Saved: cal_intervals.parquet ({len(cal_intervals):,} rows)")
+
     print_coverage_report(
         interval_df      = test_intervals,
         return_history   = return_history,
